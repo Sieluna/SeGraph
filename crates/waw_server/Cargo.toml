@@ -1,0 +1,18 @@
+[package]
+name = "waw_server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+waw_core.workspace = true
+waw_proto.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+bytes.workspace = true
+futures-util.workspace = true
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile = "3"

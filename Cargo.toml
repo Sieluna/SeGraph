@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[workspace.dependencies]
+waw_core = { path = "crates/waw_core" }
+waw_proto = { path = "crates/waw_proto" }
+waw_server = { path = "crates/waw_server" }
+bytes = { version = "1", default-features = false }
+futures-util = { version = "0.3", default-features = false }
+rkyv = { version = "0.8", default-features = false }
+serde = { version = "1", default-features = false }
+serde_json = { version = "1", default-features = false }
+thiserror = { version = "2", default-features = false }
+tokio = { version = "1", default-features = false }
+url = { version = "2", default-features = false }

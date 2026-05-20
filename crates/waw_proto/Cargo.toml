@@ -1,0 +1,9 @@
+[package]
+name = "waw_proto"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+rkyv = { workspace = true, features = ["alloc", "bytecheck", "bytes-1"] }
