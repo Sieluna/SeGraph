@@ -58,7 +58,7 @@ where
     >,
 {
     rkyv::to_bytes::<RkyvError>(message)
-        .map(|bytes| bytes.to_vec())
+        .map(|bytes| bytes.into_vec())
         .map_err(|error| WireError::Encode(error.to_string()))
 }
 

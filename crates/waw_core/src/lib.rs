@@ -22,12 +22,15 @@ pub use self::pointer::{DeadComponentError, Pointer, WeakPointer};
 pub use self::storage::{Item, Iter, IterMut, Storage};
 
 pub type Index = usize;
+/// Reference counter type.
 type RefCount = u16;
+/// Epoch tracks the number of overwrites per storage slot.
 type Epoch = u16;
 
 type StorageId = u8;
 static STORAGE_UID: AtomicUsize = AtomicUsize::new(0);
 
+/// Buffered refcount updates.
 #[derive(Debug)]
 struct Pending {
     add_ref: Vec<Index>,
@@ -47,4 +50,5 @@ impl Pending {
     }
 }
 
+/// Shared handle to pending updates.
 type PendingRef = Arc<Mutex<Pending>>;

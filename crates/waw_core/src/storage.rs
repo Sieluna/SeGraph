@@ -9,6 +9,7 @@ use super::{
     Slice, StorageId,
 };
 
+/// Inner storage data locked by the mutex.
 #[derive(Debug)]
 pub struct StorageInner<T> {
     pub data: Vec<T>,
@@ -36,6 +37,7 @@ impl<T> StorageInner<T> {
     }
 }
 
+/// Component storage with automatic refcounting and efficient linear layout.
 #[derive(Debug)]
 pub struct Storage<T> {
     inner: StorageInner<T>,
@@ -113,11 +115,13 @@ impl<T> Storage<T> {
         }
     }
 
+    /// Create a new empty storage.
     #[must_use]
     pub fn new() -> Self {
         Self::new_impl(Vec::new(), Vec::new(), Vec::new())
     }
 
+    /// Create a new empty storage with specified capacity.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self::new_impl(
@@ -127,6 +131,7 @@ impl<T> Storage<T> {
         )
     }
 
+    /// Flush pending refcount updates so `iter`/`iter_mut` reflect true liveness. Blocks the storage.
     pub fn sync_pending(&mut self) {
         let mut pending = self.pending.lock();
         while pending.epoch.len() < self.inner.data.len() {
@@ -148,6 +153,7 @@ impl<T> Storage<T> {
         }
     }
 
+    /// Iterate live components. Stale until `sync_pending` is called.
     #[inline]
     #[must_use]
     pub const fn iter(&self) -> Iter<'_, T> {
@@ -158,6 +164,7 @@ impl<T> Storage<T> {
         }
     }
 
+    /// Iterate all components including dead ones. Faster than `iter` (skips refcount).
     #[inline]
     #[must_use]
     pub const fn iter_all(&self) -> Iter<'_, T> {
@@ -168,6 +175,7 @@ impl<T> Storage<T> {
         }
     }
 
+    /// Iterate live components mutably. Stale until `sync_pending` is called.
     #[inline]
     #[must_use]
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
@@ -177,11 +185,13 @@ impl<T> Storage<T> {
         }
     }
 
+    /// Iterate all components mutably including dead ones. Faster than `iter_mut`.
     #[inline]
     pub fn iter_all_mut(&mut self) -> core::slice::IterMut<'_, T> {
         self.inner.data.iter_mut()
     }
 
+    /// Pin an iterated item as a `Pointer`.
     #[must_use]
     pub fn pin(&self, item: &Item<T>) -> Pointer<T> {
         let mut pending = self.pending.lock();
@@ -193,11 +203,14 @@ impl<T> Storage<T> {
         }
     }
 
+    /// Split the storage at the given pointer, returning
+    /// (left slice, pointed data, right slice).
     pub fn split(&mut self, pointer: &Pointer<T>) -> (Slice<'_, T>, &mut T, Slice<'_, T>) {
         debug_assert_eq!(pointer.data.get_storage_id(), self.id);
         self.inner.split(pointer.data)
     }
 
+    /// Streaming mutable iterator over live components. Stale until `sync_pending`.
     #[inline]
     #[must_use]
     pub const fn cursor(&mut self) -> Cursor<'_, T> {
@@ -209,6 +222,7 @@ impl<T> Storage<T> {
         }
     }
 
+    /// Cursor positioned at the end, for backwards iteration.
     #[inline]
     #[must_use]
     pub const fn cursor_end(&mut self) -> Cursor<'_, T> {
@@ -221,6 +235,7 @@ impl<T> Storage<T> {
         }
     }
 
+    /// Add a component to the storage, returning a `Pointer` to it.
     #[must_use]
     pub fn create(&mut self, value: T) -> Pointer<T> {
         let data = if let Some(data) = self.inner.free_list.pop() {
@@ -250,6 +265,7 @@ impl<T> Default for Storage<T> {
     }
 }
 
+/// Item yielded by `Iter`.
 #[derive(Debug, Clone, Copy)]
 pub struct Item<'a, T> {
     pub data: &'a T,
@@ -263,6 +279,7 @@ impl<T> core::ops::Deref for Item<'_, T> {
     }
 }
 
+/// Iterator for reading components.
 #[derive(Debug)]
 pub struct Iter<'a, T> {
     storage: &'a StorageInner<T>,
@@ -299,6 +316,7 @@ impl<T> Clone for Iter<'_, T> {
     }
 }
 
+/// Iterator for writing components.
 #[derive(Debug)]
 pub struct IterMut<'a, T> {
     data: core::slice::IterMut<'a, T>,

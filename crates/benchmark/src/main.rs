@@ -60,19 +60,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Total core time: {} ms", total_ms);
         }
 
-        // waw_server benchmark: production GraphStore + SQLite path
+        // waw_server benchmark: Pipeline (waw_core Storage + CSR + tiered cache)
         if mode == "all" || mode == "waw" || mode == "server" {
-            println!("\n  --- waw_server (GraphStore + SQLite + SpatialIndex) ---");
+            println!("\n  --- waw_server (Pipeline: waw_core + CSR + warm/cold tiers) ---");
             let t0 = Instant::now();
             let results = waw_server_bench::run_benchmarks(&nodes, &edges);
-            println!("  Load:      {:>8} ms", results.load_ms);
-            println!("  Entities:  {:>8}", results.entity_count);
-            println!("  Edges:     {:>8}", results.edge_count);
-            println!(
-                "  Full scan: {:>8} ms ({} nodes)",
-                results.full_scan_ms,
-                nodes.len()
-            );
+            println!("  Load:       {:>8} ms", results.load_ms);
+            println!("  Memory:     {:>8} bytes", results.memory_used_bytes);
+            println!("  Entities:   {:>8}", results.entity_count);
+            println!("  Edges:      {:>8}", results.edge_count);
+            for eg in &results.entity_gets {
+                println!(
+                    "  GetEntity #{}: {:>8} μs (hit={})",
+                    eg.id, eg.elapsed_us, eg.hit
+                );
+            }
             for vp in &results.spatial_queries {
                 println!(
                     "  Spatial [{:.2}..{:.2}, {:.2}..{:.2}]: {:>8} μs, matched {}",
@@ -85,8 +87,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tr.depth, tr.start_id, tr.elapsed_us, tr.visited
                 );
             }
+            println!(
+                "  Full scan:  {:>8} ms ({} nodes)",
+                results.full_scan_ms,
+                nodes.len()
+            );
             let total_ms = t0.elapsed().as_millis();
-            println!("  Total server time: {} ms", total_ms);
+            println!("  Total pipeline time: {} ms", total_ms);
         }
 
         // Run Neo4j benchmark (if available and mode allows)

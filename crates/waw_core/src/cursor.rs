@@ -3,6 +3,7 @@ use core::ops::{Deref, DerefMut};
 
 use super::{Index, PendingRef, Pointer, PointerData, StorageId, StorageInner};
 
+/// Storage slice for cursor iteration.
 #[derive(Debug)]
 pub struct Slice<'a, T> {
     pub slice: &'a mut [T],
@@ -10,11 +11,13 @@ pub struct Slice<'a, T> {
 }
 
 impl<'a, T> Slice<'a, T> {
+    /// Check if the slice contains no elements.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.slice.is_empty()
     }
 
+    /// Get a reference by pointer. Returns `None` if out of bounds.
     #[must_use]
     pub fn get(&'a self, pointer: &Pointer<T>) -> Option<&'a T> {
         debug_assert_eq!(pointer.data.get_storage_id(), self.offset.get_storage_id());
@@ -25,6 +28,7 @@ impl<'a, T> Slice<'a, T> {
         self.slice.get(index)
     }
 
+    /// Get a mutable reference by pointer. Returns `None` if out of bounds.
     #[must_use]
     pub fn get_mut(&'a mut self, pointer: &Pointer<T>) -> Option<&'a mut T> {
         debug_assert_eq!(pointer.data.get_storage_id(), self.offset.get_storage_id());
@@ -36,6 +40,7 @@ impl<'a, T> Slice<'a, T> {
     }
 }
 
+/// Streaming iterator item. Allows accessing sibling components while iterating.
 #[derive(Debug)]
 pub struct CursorItem<'a, T> {
     item: &'a mut T,
@@ -57,6 +62,7 @@ impl<T> DerefMut for CursorItem<'_, T> {
 }
 
 impl<T> CursorItem<'_, T> {
+    /// Pin the item with a strong pointer.
     #[must_use]
     pub fn pin(&self) -> Pointer<T> {
         let epoch = {
@@ -72,6 +78,7 @@ impl<T> CursorItem<'_, T> {
     }
 }
 
+/// Streaming mutable iterator with look-back/ahead.
 #[derive(Debug)]
 pub struct Cursor<'a, T> {
     pub(crate) storage: &'a mut StorageInner<T>,
@@ -92,6 +99,7 @@ impl<T> Cursor<'_, T> {
         (left, item, right)
     }
 
+    /// Advance the stream to the next item.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<(Slice<'_, T>, CursorItem<'_, T>, Slice<'_, T>)> {
         loop {
@@ -108,6 +116,7 @@ impl<T> Cursor<'_, T> {
         }
     }
 
+    /// Advance the stream to the previous item.
     pub fn prev(&mut self) -> Option<(Slice<'_, T>, CursorItem<'_, T>, Slice<'_, T>)> {
         loop {
             if self.index == 0 {

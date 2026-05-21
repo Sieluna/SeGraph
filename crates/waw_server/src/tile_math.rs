@@ -62,7 +62,7 @@ mod tests {
     }
 
     #[test]
-    fn computes_viewport_tile_range_like_server_js() {
+    fn computes_viewport_tile_range() {
         let range = tiles_for_bounds(
             Bounds {
                 min_x: -0.6,

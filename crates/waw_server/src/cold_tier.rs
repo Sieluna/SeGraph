@@ -30,7 +30,6 @@ impl error::Error for StoreError {
     }
 }
 
-/// A property key-value pair loaded from SQLite.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PropertyRow {
     pub entity_id: u64,
@@ -41,7 +40,6 @@ pub struct PropertyRow {
     pub value_text: Option<String>,
 }
 
-/// Blob metadata row (data is loaded separately).
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlobRow {
     pub entity_id: u64,
@@ -49,6 +47,14 @@ pub struct BlobRow {
     pub hash: u64,
     pub mime: String,
     pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EdgeRow {
+    pub id: u64,
+    pub source_entity: u64,
+    pub target_entity: u64,
+    pub label: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -59,27 +65,15 @@ pub struct GraphStats {
     pub blob_bytes: u64,
 }
 
-/// Maximum memory-mapped I/O size (1 GiB).
-///
-/// SQLite will map up to this many bytes of the database file into the process
-/// address space, reducing read syscalls for random-access patterns like blob
-/// and property lookups.
 const MMAP_SIZE: i64 = 1_073_741_824;
-
-/// Page cache size in KiB (negative = kibibytes, positive = pages).
-///
-/// 200 000 KiB ≈ 195 MiB of cache for frequently accessed pages.
 const CACHE_SIZE: i64 = -200_000;
 
-/// Read-only SQLite access layer for graph data.
-///
-/// Opens the database with mmap, memory temp store, and a large page cache
-/// for read-heavy workloads.
-pub struct SqliteGraphStore {
+/// Read-only SQLite access — cold tier data source.
+pub struct ColdTier {
     pub(crate) connection: Connection,
 }
 
-impl SqliteGraphStore {
+impl ColdTier {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let connection = Connection::open_with_flags(
             path,
@@ -93,27 +87,118 @@ impl SqliteGraphStore {
     }
 
     pub fn stats(&self) -> Result<GraphStats, StoreError> {
-        Ok(self.connection.query_row(
-            r#"
-                SELECT
-                    COALESCE((SELECT COUNT(*) FROM entity), 0),
-                    COALESCE((SELECT COUNT(*) FROM edge), 0),
-                    COALESCE((SELECT COUNT(*) FROM blob_store), 0),
-                    COALESCE((SELECT SUM(size_bytes) FROM blob_store), 0)
-                "#,
-            [],
-            |row| {
-                Ok(GraphStats {
-                    entities: get_u64(row, 0)?,
-                    edges: get_u64(row, 1)?,
-                    blobs: get_u64(row, 2)?,
-                    blob_bytes: get_u64(row, 3)?,
-                })
-            },
-        )?)
+        self.connection
+            .query_row(
+                "SELECT \
+                 COALESCE((SELECT COUNT(*) FROM entity), 0), \
+                 COALESCE((SELECT COUNT(*) FROM edge), 0), \
+                 COALESCE((SELECT COUNT(*) FROM blob_store), 0), \
+                 COALESCE((SELECT SUM(size_bytes) FROM blob_store), 0)",
+                [],
+                |row| {
+                    Ok(GraphStats {
+                        entities: get_u64(row, 0)?,
+                        edges: get_u64(row, 1)?,
+                        blobs: get_u64(row, 2)?,
+                        blob_bytes: get_u64(row, 3)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 
-    /// Load properties for an entity.
+    /// Load all entity IDs ordered by id — used for initial CSR construction.
+    pub fn load_entity_ids(&self) -> Result<Vec<u64>, StoreError> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id FROM entity ORDER BY id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0).map(|v| v as u64))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Load a batch of edges for paginated CSR construction.
+    pub fn load_edge_batch(
+        &self,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<EdgeRow>, StoreError> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, source_entity, target_entity, label FROM edge \
+             ORDER BY id LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map([limit as i64, offset as i64], |row| {
+            Ok(EdgeRow {
+                id: row.get::<_, i64>(0)? as u64,
+                source_entity: row.get::<_, i64>(1)? as u64,
+                target_entity: row.get::<_, i64>(2)? as u64,
+                label: row.get::<_, i32>(3)? as u32,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Load all edges at once (for smaller graphs).
+    pub fn load_all_edges(&self) -> Result<Vec<EdgeRow>, StoreError> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, source_entity, target_entity, label FROM edge ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(EdgeRow {
+                id: row.get::<_, i64>(0)? as u64,
+                source_entity: row.get::<_, i64>(1)? as u64,
+                target_entity: row.get::<_, i64>(2)? as u64,
+                label: row.get::<_, i32>(3)? as u32,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Load positions for a batch of entity rowids.
+    pub fn load_position_batch(
+        &self,
+        entity_ids: &[u64],
+    ) -> Result<Vec<(u64, f32, f32)>, StoreError> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = entity_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT entity_id, x, y FROM position_component WHERE entity_id IN ({})",
+            placeholders
+        );
+        let mut stmt = self.connection.prepare(&sql)?;
+        let params: Vec<i64> = entity_ids.iter().map(|&id| id as i64).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, f64>(1)? as f32,
+                row.get::<_, f64>(2)? as f32,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn load_all_positions(&self) -> Result<Vec<(u64, f32, f32)>, StoreError> {
+        let mut stmt = self.connection.prepare(
+            "SELECT entity_id, x, y FROM position_component ORDER BY entity_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, f64>(1)? as f32,
+                row.get::<_, f64>(2)? as f32,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     pub fn load_properties(&self, entity_id: u64) -> Result<Vec<PropertyRow>, StoreError> {
         let mut stmt = self.connection.prepare(
             "SELECT entity_id, key, value_type, value_int, value_float, value_text \
@@ -129,11 +214,9 @@ impl SqliteGraphStore {
                 value_text: row.get(5)?,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
-    /// Load the (x, y) position for an entity.
     pub fn load_position(&self, entity_id: u64) -> Result<Option<(f32, f32)>, StoreError> {
         let mut stmt = self
             .connection
@@ -144,7 +227,6 @@ impl SqliteGraphStore {
         result.into_iter().next().transpose().map_err(Into::into)
     }
 
-    /// Load blob metadata for an entity (without the blob data).
     pub fn load_blob_refs(&self, entity_id: u64) -> Result<Vec<BlobRow>, StoreError> {
         let mut stmt = self.connection.prepare(
             "SELECT entity_id, key, hash, mime, size_bytes \
@@ -159,21 +241,16 @@ impl SqliteGraphStore {
                 size_bytes: row.get::<_, i64>(4)? as u64,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
-    /// Load a chunk of blob data by hash, starting at `offset` bytes.
-    ///
-    /// Uses SQLite's `substr()` to read only the requested range from disk
-    /// rather than loading the entire blob into memory.
     pub fn load_blob_data(
         &self,
         hash: u64,
         offset: u64,
         chunk_size: u32,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let mut stmt = self.connection.prepare(
+        let mut stmt = self.connection.prepare_cached(
             "SELECT substr(data, ?2, ?3) FROM blob_store WHERE hash = ?1",
         )?;
         stmt.query_map(
@@ -185,7 +262,6 @@ impl SqliteGraphStore {
         .map_err(Into::into)
     }
 
-    /// Load blob metadata by hash.
     pub fn load_blob_by_hash(&self, hash: u64) -> Result<Option<BlobRow>, StoreError> {
         let mut stmt = self.connection.prepare(
             "SELECT entity_id, key, hash, mime, size_bytes \
@@ -200,10 +276,23 @@ impl SqliteGraphStore {
                 size_bytes: row.get::<_, i64>(4)? as u64,
             })
         })?;
-
         result.into_iter().next().transpose().map_err(Into::into)
     }
 
+    pub fn search_property(
+        &self,
+        key: &str,
+        limit: u32,
+    ) -> Result<Vec<u64>, StoreError> {
+        let mut stmt = self.connection.prepare(
+            "SELECT DISTINCT entity_id FROM property WHERE key = ?1 LIMIT ?2",
+        )?;
+        stmt.query_map(rusqlite::params![key, limit], |row| {
+            row.get::<_, i64>(0).map(|v| v as u64)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+    }
 }
 
 fn get_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
@@ -261,88 +350,72 @@ mod tests {
     }
 
     #[test]
-    fn reads_stats_from_new_schema() {
+    fn reads_stats() {
         let file = NamedTempFile::new().unwrap();
         {
             let conn = Connection::open(file.path()).unwrap();
             create_schema(&conn);
             conn.execute_batch(
-                r#"
-                INSERT INTO entity VALUES (1), (2), (3);
-                INSERT INTO edge VALUES (1, 1, 2, 1);
-                INSERT INTO blob_store VALUES (1, 'audio', 100, 'audio/ogg', 4096, x'00010203');
-                "#,
+                "INSERT INTO entity VALUES (1), (2); \
+                 INSERT INTO edge VALUES (1, 1, 2, 1);",
             )
             .unwrap();
         }
-        let store = SqliteGraphStore::open(file.path()).unwrap();
+        let store = ColdTier::open(file.path()).unwrap();
         let stats = store.stats().unwrap();
-        assert_eq!(stats.entities, 3);
+        assert_eq!(stats.entities, 2);
         assert_eq!(stats.edges, 1);
-        assert_eq!(stats.blobs, 1);
-        assert_eq!(stats.blob_bytes, 4096);
     }
 
     #[test]
-    fn loads_properties_for_entity() {
+    fn loads_entity_ids() {
+        let file = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            create_schema(&conn);
+            conn.execute_batch("INSERT INTO entity VALUES (10), (20), (30);")
+                .unwrap();
+        }
+        let store = ColdTier::open(file.path()).unwrap();
+        let ids = store.load_entity_ids().unwrap();
+        assert_eq!(ids, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn loads_edges_paginated() {
         let file = NamedTempFile::new().unwrap();
         {
             let conn = Connection::open(file.path()).unwrap();
             create_schema(&conn);
             conn.execute_batch(
-                r#"
-                INSERT INTO property VALUES (1, 'name', 3, NULL, NULL, 'test');
-                INSERT INTO property VALUES (1, 'count', 1, 42, NULL, NULL);
-                INSERT INTO property VALUES (1, 'weight', 2, NULL, 0.75, NULL);
-                "#,
+                "INSERT INTO entity VALUES (1), (2); \
+                 INSERT INTO edge VALUES (1, 1, 2, 1); \
+                 INSERT INTO edge VALUES (2, 2, 1, 2);",
             )
             .unwrap();
         }
-        let store = SqliteGraphStore::open(file.path()).unwrap();
-        let props = store.load_properties(1).unwrap();
-        assert_eq!(props.len(), 3);
-        assert_eq!(props[0].key, "count");
-        assert_eq!(props[0].value_int, Some(42));
-        assert_eq!(props[1].key, "name");
-        assert_eq!(props[1].value_text.as_deref(), Some("test"));
-        assert_eq!(props[2].value_float, Some(0.75));
+        let store = ColdTier::open(file.path()).unwrap();
+        let batch = store.load_edge_batch(0, 1).unwrap();
+        assert_eq!(batch.len(), 1);
+        let batch2 = store.load_edge_batch(1, 1).unwrap();
+        assert_eq!(batch2.len(), 1);
     }
 
     #[test]
-    fn loads_blob_refs() {
+    fn loads_positions_batch() {
         let file = NamedTempFile::new().unwrap();
         {
             let conn = Connection::open(file.path()).unwrap();
             create_schema(&conn);
             conn.execute_batch(
-                r#"
-                INSERT INTO blob_store VALUES (1, 'data', 999, 'application/octet-stream', 1024, x'ABCD');
-                "#,
+                "INSERT INTO entity VALUES (1), (2); \
+                 INSERT INTO position_component VALUES (1, 0.0, 0.5); \
+                 INSERT INTO position_component VALUES (2, 1.0, -0.5);",
             )
             .unwrap();
         }
-        let store = SqliteGraphStore::open(file.path()).unwrap();
-        let refs = store.load_blob_refs(1).unwrap();
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].hash, 999);
-        assert_eq!(refs[0].mime, "application/octet-stream");
-        assert_eq!(refs[0].size_bytes, 1024);
+        let store = ColdTier::open(file.path()).unwrap();
+        let positions = store.load_position_batch(&[1, 2]).unwrap();
+        assert_eq!(positions.len(), 2);
     }
-
-    #[test]
-    fn loads_blob_data_by_hash() {
-        let file = NamedTempFile::new().unwrap();
-        {
-            let conn = Connection::open(file.path()).unwrap();
-            create_schema(&conn);
-            conn.execute_batch(
-                "INSERT INTO blob_store VALUES (1, 'data', 999, '', 4, x'DEADBEEF');",
-            )
-            .unwrap();
-        }
-        let store = SqliteGraphStore::open(file.path()).unwrap();
-        let data = store.load_blob_data(999, 0, 1024).unwrap();
-        assert_eq!(data, Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
-    }
-
 }

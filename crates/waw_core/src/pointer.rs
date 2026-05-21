@@ -4,9 +4,11 @@ use core::marker::PhantomData;
 
 use super::{PendingRef, PointerData};
 
+/// Error from upgrading a `WeakPointer` whose component was destroyed.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DeadComponentError;
 
+/// Strong reference to a component. The component outlives this pointer.
 pub struct Pointer<T> {
     pub data: PointerData,
     pub(crate) pending: PendingRef,
@@ -25,6 +27,7 @@ impl<T> Debug for Pointer<T> {
 }
 
 impl<T> Pointer<T> {
+    /// Creates a new `WeakPointer` to this component.
     #[inline]
     #[must_use]
     pub fn downgrade(&self) -> WeakPointer<T> {
@@ -84,6 +87,7 @@ impl<T> Drop for Pointer<T> {
     }
 }
 
+/// Weak variant of `Pointer`. Breaks reference cycles. Upgrade to access.
 #[derive(Debug)]
 pub struct WeakPointer<T> {
     data: PointerData,
@@ -92,6 +96,7 @@ pub struct WeakPointer<T> {
 }
 
 impl<T> WeakPointer<T> {
+    /// Upgrade to a `Pointer`. Returns `DeadComponentError` if the component was destroyed.
     pub fn upgrade(&self) -> Result<Pointer<T>, DeadComponentError> {
         let mut pending = self.pending.lock();
         if pending.get_epoch(self.data.get_index()) != self.data.get_epoch() {
