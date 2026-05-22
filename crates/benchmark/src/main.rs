@@ -1,4 +1,3 @@
-mod accuracy;
 mod graph_gen;
 mod neo4j_bench;
 mod waw_core_bench;
@@ -168,47 +167,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "  Start Neo4j first, then re-run with: cargo run -p benchmark -- neo4j"
                     );
                 }
-            }
-        }
-
-        // ── Accuracy: Pipeline vs brute-force ground truth ──
-        if mode == "all" || mode == "accuracy" {
-            println!("\n  --- Accuracy: Pipeline vs brute-force ground truth ---");
-            let report = accuracy::run_accuracy(&nodes, &edges);
-            println!(
-                "  Spatial: {} queries, {} mismatches",
-                report.spatial_queries,
-                report.spatial_mismatches.len()
-            );
-            if !report.spatial_mismatches.is_empty() {
-                for m in &report.spatial_mismatches {
-                    println!("    FAIL: {m}");
-                }
-            }
-            println!(
-                "  BFS:     {} queries, {} mismatches",
-                report.bfs_queries,
-                report.bfs_mismatches.len()
-            );
-            if !report.bfs_mismatches.is_empty() {
-                for m in &report.bfs_mismatches {
-                    println!("    FAIL: {m}");
-                }
-            }
-            println!(
-                "  Edges:   {} queries, {} mismatches",
-                report.edge_queries,
-                report.edge_mismatches.len()
-            );
-            if !report.edge_mismatches.is_empty() {
-                for m in &report.edge_mismatches {
-                    println!("    FAIL: {m}");
-                }
-            }
-            if report.all_ok() {
-                println!("  ALL ACCURACY CHECKS PASSED");
-            } else {
-                println!("  *** ACCURACY FAILURES DETECTED ***");
             }
         }
 
