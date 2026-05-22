@@ -2,6 +2,7 @@ mod bench_runner;
 mod graph_gen;
 mod neo4j_bench;
 mod report;
+mod system;
 mod types;
 mod waw_bench;
 
@@ -133,21 +134,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let index_build_ms = index_start.elapsed().as_millis() as u64;
 
-            match waw_bench::run_benchmarks(
-                    &url,
-                    &nodes,
-                    edges.len() as u64,
-                    &runner,
-                    db_create_ms,
-                    index_build_ms,
-                )
-                .await
-            {
-                Ok(mut results) => {
-                    results.scale_label = scale.label().to_string();
+            match waw_bench::WawBenchSystem::connect(&url).await {
+                Ok((mut system, connect_ms)) => {
+                    let results = system::run_benchmark_suite(
+                        &mut system,
+                        "waw_server",
+                        scale.label(),
+                        nodes.len() as u64,
+                        edges.len() as u64,
+                        Some(connect_ms),
+                        Some(db_create_ms + index_build_ms),
+                        &runner,
+                    )
+                    .await;
                     println!(
                         "  Connect:      {:>8} ms",
-                        results.connection_ms.unwrap_or(0)
+                        connect_ms
                     );
                     println!(
                         "  SQLite create:{:>8} ms",
@@ -175,19 +177,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if do_neo4j {
             println!("\n  --- Neo4j (Bolt) ---");
 
-            match neo4j_bench::run_benchmarks(
+            match neo4j_bench::prepare_neo4j(
                 &nodes,
                 &edges,
                 &neo4j_uri,
                 &neo4j_user,
                 &neo4j_pass,
-                &runner,
             )
             .await
             {
-                Ok(mut results) => {
-                    results.scale_label = scale.label().to_string();
-                    println!("  Import:     {:>8} ms", results.import_ms.unwrap_or(0));
+                Ok((mut system, import_ms)) => {
+                    let results = system::run_benchmark_suite(
+                        &mut system,
+                        "neo4j",
+                        scale.label(),
+                        nodes.len() as u64,
+                        edges.len() as u64,
+                        None,
+                        Some(import_ms),
+                        &runner,
+                    )
+                    .await;
+                    println!("  Import:     {:>8} ms", import_ms);
                     print_samples(&results);
                     all_results.push(results);
                 }
