@@ -68,6 +68,14 @@ where
     T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>
         + Deserialize<T, rkyv::api::high::HighDeserializer<RkyvError>>,
 {
+    // rkyv zero-copy deserialization requires 8-byte aligned input.
+    // Network buffers (Bytes from tungstenite) may not satisfy this.
+    if bytes.as_ptr() as usize % 8 != 0 {
+        let mut aligned = rkyv::util::AlignedVec::<8>::with_capacity(bytes.len());
+        aligned.extend_from_slice(bytes);
+        return rkyv::from_bytes::<T, RkyvError>(&aligned)
+            .map_err(|error| WireError::Decode(error.to_string()));
+    }
     rkyv::from_bytes::<T, RkyvError>(bytes).map_err(|error| WireError::Decode(error.to_string()))
 }
 

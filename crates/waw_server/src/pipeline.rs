@@ -1,10 +1,13 @@
+use std::ops::Index;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 use waw_proto::Direction;
 
+use crate::cold_pool::ColdPool;
 use crate::cold_tier::{ColdTier, StoreError};
-use crate::hot_tier::{EntityMeta, HotTier};
+use crate::entity_store::{EntityMeta, EntityStore};
+use crate::graph_index::GraphIndex;
 use crate::warm_tier::WarmTier;
 
 /// Pipeline configuration.
@@ -31,12 +34,21 @@ impl Default for PipelineConfig {
 ///
 /// Tier 1 (hot): in-memory waw_core `Storage` + CSR edge index
 /// Tier 2 (warm): mmap-backed disk cache for evicted entities
-/// Tier 3 (cold): read-only SQLite database
+/// Tier 3 (cold): pooled read-only SQLite connections
 pub struct Pipeline {
-    hot: RwLock<HotTier>,
+    /// Immutable graph topology — CSR edges, spatial index, entity lookup. No lock.
+    index: Arc<GraphIndex>,
+    /// Mutable entity state — promotion, eviction, LRU. RwLock: reads shared, writes exclusive.
+    entities: RwLock<EntityStore>,
     warm: Mutex<WarmTier>,
-    cold: Arc<Mutex<ColdTier>>,
+    cold_pool: ColdPool,
     config: PipelineConfig,
+}
+
+fn pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(2)
 }
 
 impl Pipeline {
@@ -46,9 +58,17 @@ impl Pipeline {
         warm_cache_path: Option<impl AsRef<Path>>,
         config: PipelineConfig,
     ) -> Result<Self, StoreError> {
-        let cold = Arc::new(Mutex::new(ColdTier::open(db_path)?));
-        let mut hot = HotTier::load(&cold.lock().unwrap())?;
-        hot.memory_threshold = config.hot_memory_threshold;
+        // Open a single connection for bulk load, then replace with a pool
+        let load_cold = ColdTier::open(&db_path)?;
+        let (index, pos_pairs, entity_count, edge_memory) = GraphIndex::load(&load_cold)?;
+        drop(load_cold);
+
+        let cold_pool = ColdPool::open(&db_path, pool_size())?;
+
+        let mut entities =
+            EntityStore::with_capacity(entity_count, config.hot_memory_threshold);
+        entities.memory_used = edge_memory;
+        entities.populate(entity_count, &pos_pairs);
 
         let warm = match warm_cache_path {
             Some(p) => {
@@ -57,16 +77,18 @@ impl Pipeline {
                     .unwrap_or_else(|_| WarmTier::create(&path, config.warm_cache_capacity).unwrap())
             }
             None => {
-                let tmp = std::env::temp_dir().join(format!("waw_warm_{}.cache", std::process::id()));
+                let tmp = std::env::temp_dir()
+                    .join(format!("waw_warm_{}.cache", std::process::id()));
                 WarmTier::create(&tmp, config.warm_cache_capacity)
                     .unwrap_or_else(|_| WarmTier::create("waw_warm.cache", config.warm_cache_capacity).unwrap())
             }
         };
 
         Ok(Self {
-            hot: RwLock::new(hot),
+            index: Arc::new(index),
+            entities: RwLock::new(entities),
             warm: Mutex::new(warm),
-            cold,
+            cold_pool,
             config,
         })
     }
@@ -75,8 +97,8 @@ impl Pipeline {
     pub fn get_entity(&self, rowid: u64) -> Result<Option<EntityMeta>, StoreError> {
         // 1. Check hot tier — read-only fast path (no LRU update)
         {
-            let hot = self.hot.read().unwrap();
-            if let Some(meta) = hot.get_entity_readonly(rowid) {
+            let entities = self.entities.read().unwrap();
+            if let Some(meta) = entities.get_entity_readonly(rowid, &self.index) {
                 return Ok(Some(meta.clone()));
             }
         }
@@ -87,10 +109,9 @@ impl Pipeline {
             if warm.contains(rowid) {
                 if let Ok(Some(meta)) = warm.get(rowid) {
                     drop(warm);
-                    // Promote to hot tier
-                    let mut hot = self.hot.write().unwrap();
-                    hot.reload_entity(rowid, meta.position);
-                    self.maybe_evict_inner(&mut *hot)?;
+                    let mut entities = self.entities.write().unwrap();
+                    entities.reload_entity(rowid, meta.position, &self.index);
+                    self.maybe_evict_inner(&mut *entities)?;
                     return Ok(Some(meta));
                 }
             }
@@ -98,15 +119,15 @@ impl Pipeline {
 
         // 3. Check cold tier
         {
-            let cold = self.cold.lock().unwrap();
+            let cold = self.cold_pool.acquire();
             let position = cold.load_position(rowid)?;
             drop(cold);
 
             if let Some(pos) = position {
-                let mut hot = self.hot.write().unwrap();
-                hot.reload_entity(rowid, Some(pos));
-                let meta = hot.get_entity_readonly(rowid).cloned();
-                self.maybe_evict_inner(&mut *hot)?;
+                let mut entities = self.entities.write().unwrap();
+                entities.reload_entity(rowid, Some(pos), &self.index);
+                let meta = entities.get_entity_readonly(rowid, &self.index).cloned();
+                self.maybe_evict_inner(&mut *entities)?;
                 return Ok(meta);
             }
         }
@@ -114,7 +135,7 @@ impl Pipeline {
         Ok(None)
     }
 
-    /// Get outgoing and/or incoming edges for an entity.
+    /// Get outgoing and/or incoming edges for an entity — **lock-free**.
     #[must_use]
     pub fn get_edges(
         &self,
@@ -123,23 +144,22 @@ impl Pipeline {
         label_filter: &[u32],
         limit: u32,
     ) -> Vec<waw_proto::EdgeData> {
-        let hot = self.hot.read().unwrap();
-        let Some(entity_idx) = hot.edge_csr.find_entity_index(entity_id) else {
+        let Some(entity_idx) = self.index.find_entity_index(entity_id) else {
             return Vec::new();
         };
         let limit = limit as usize;
         let mut result = Vec::new();
 
         if matches!(direction, Direction::Outgoing | Direction::Both) {
-            let edges = hot.edge_csr.outgoing(entity_idx);
+            let edges = self.index.edge_csr.outgoing(entity_idx);
             let n = edges.targets.len().min(limit - result.len());
             for i in 0..n {
                 let label = edges.labels[i] as u32;
                 if !label_filter.is_empty() && !label_filter.contains(&label) {
                     continue;
                 }
-                let src = hot.edge_csr.entity_rowid(entity_idx);
-                let tgt = hot.edge_csr.entity_rowid(edges.targets[i]);
+                let src = self.index.edge_csr.entity_rowid(entity_idx);
+                let tgt = self.index.edge_csr.entity_rowid(edges.targets[i]);
                 result.push(waw_proto::EdgeData {
                     id: edges.rowids[i],
                     source: src,
@@ -153,15 +173,15 @@ impl Pipeline {
         if matches!(direction, Direction::Incoming | Direction::Both)
             && result.len() < limit
         {
-            let edges = hot.edge_csr.incoming(entity_idx);
+            let edges = self.index.edge_csr.incoming(entity_idx);
             let n = edges.sources.len().min(limit - result.len());
             for i in 0..n {
                 let label = edges.labels[i] as u32;
                 if !label_filter.is_empty() && !label_filter.contains(&label) {
                     continue;
                 }
-                let src = hot.edge_csr.entity_rowid(edges.sources[i]);
-                let tgt = hot.edge_csr.entity_rowid(entity_idx);
+                let src = self.index.edge_csr.entity_rowid(edges.sources[i]);
+                let tgt = self.index.edge_csr.entity_rowid(entity_idx);
                 result.push(waw_proto::EdgeData {
                     id: edges.rowids[i],
                     source: src,
@@ -175,7 +195,7 @@ impl Pipeline {
         result
     }
 
-    /// BFS traversal from a starting entity (read lock — fast, allocating path).
+    /// BFS traversal — **lock-free**, uses thread-local buffers.
     #[must_use]
     pub fn traverse_bfs(
         &self,
@@ -184,13 +204,13 @@ impl Pipeline {
         edge_labels: &[u32],
         limit: u32,
     ) -> Vec<u64> {
-        let hot = self.hot.read().unwrap();
-        let mut visited = hot.traverse_bfs(start_rowid, max_depth, edge_labels);
+        let mut visited = self.index.traverse_bfs(start_rowid, max_depth, edge_labels);
         visited.truncate(limit as usize);
         visited
     }
 
-    /// Spatial bounding-box query (write lock — reuses internal buffers, O(n) gen-counter dedup).
+    /// Spatial bounding-box query — shared entity read lock only.
+    /// Results are exactly filtered by entity position (not just tile overlap).
     #[must_use]
     pub fn search_spatial(
         &self,
@@ -201,21 +221,31 @@ impl Pipeline {
         lod: u16,
         limit: u32,
     ) -> Vec<u64> {
-        let mut hot = self.hot.write().unwrap();
+        let entities = self.entities.read().unwrap();
         let mut out = Vec::new();
-        hot.query_spatial_into(min_x, min_y, max_x, max_y, lod, &mut out);
+        self.index.query_spatial_into(
+            min_x, min_y, max_x, max_y, lod,
+            &entities.entity_ptrs,
+            &mut out,
+        );
+        // Exact position filtering — spatial index is tile-approximate
+        out.retain(|&rowid| {
+            let Some(csr_idx) = self.index.find_entity_index(rowid) else { return false };
+            let Some(Some(ptr)) = entities.entity_ptrs.get(csr_idx as usize) else { return false };
+            let Some((x, y)) = entities.entities.index(ptr).position else { return false };
+            x >= min_x && x <= max_x && y >= min_y && y <= max_y
+        });
         out.truncate(limit as usize);
         out
     }
 
-    /// Property search — always queries cold tier (SQLite).
+    /// Property search — queries cold tier via pool.
     pub fn search_property(
         &self,
         key: &str,
         limit: u32,
     ) -> Result<Vec<u64>, StoreError> {
-        let cold = self.cold.lock().unwrap();
-        cold.search_property(key, limit)
+        self.cold_pool.acquire().search_property(key, limit)
     }
 
     /// Load entity properties from cold tier.
@@ -223,8 +253,7 @@ impl Pipeline {
         &self,
         entity_id: u64,
     ) -> Result<Vec<crate::cold_tier::PropertyRow>, StoreError> {
-        let cold = self.cold.lock().unwrap();
-        cold.load_properties(entity_id)
+        self.cold_pool.acquire().load_properties(entity_id)
     }
 
     /// Load blob references for an entity.
@@ -232,8 +261,7 @@ impl Pipeline {
         &self,
         entity_id: u64,
     ) -> Result<Vec<crate::cold_tier::BlobRow>, StoreError> {
-        let cold = self.cold.lock().unwrap();
-        cold.load_blob_refs(entity_id)
+        self.cold_pool.acquire().load_blob_refs(entity_id)
     }
 
     /// Load a blob chunk by hash.
@@ -243,8 +271,7 @@ impl Pipeline {
         offset: u64,
         chunk_size: u32,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let cold = self.cold.lock().unwrap();
-        cold.load_blob_data(hash, offset, chunk_size)
+        self.cold_pool.acquire().load_blob_data(hash, offset, chunk_size)
     }
 
     /// Load blob metadata by hash.
@@ -252,43 +279,39 @@ impl Pipeline {
         &self,
         hash: u64,
     ) -> Result<Option<crate::cold_tier::BlobRow>, StoreError> {
-        let cold = self.cold.lock().unwrap();
-        cold.load_blob_by_hash(hash)
+        self.cold_pool.acquire().load_blob_by_hash(hash)
     }
 
     /// Get database stats.
     pub fn stats(&self) -> Result<crate::cold_tier::GraphStats, StoreError> {
-        let cold = self.cold.lock().unwrap();
-        cold.stats()
+        self.cold_pool.acquire().stats()
     }
 
-    /// Check whether an entity rowid exists in the graph.
+    /// Check whether an entity rowid exists in the graph — **lock-free**.
     #[must_use]
     pub fn find_entity_index(&self, rowid: u64) -> Option<u32> {
-        let hot = self.hot.read().unwrap();
-        hot.edge_csr.find_entity_index(rowid)
+        self.index.find_entity_index(rowid)
     }
 
-    /// Get read access to the hot tier (for diagnostics/metrics).
-    #[must_use]
-    pub fn hot_tier_for_read(&self) -> std::sync::RwLockReadGuard<'_, crate::hot_tier::HotTier> {
-        self.hot.read().unwrap()
-    }
-
-    /// Get the default query LOD from the spatial index.
+    /// Get the default query LOD from the spatial index — **lock-free**.
     #[must_use]
     pub fn spatial_lod(&self) -> u16 {
-        let hot = self.hot.read().unwrap();
-        hot.spatial_index.as_ref().map_or(4, |idx| idx.bits())
+        self.index.spatial_lod()
+    }
+
+    /// Get current memory usage of the hot tier (for diagnostics).
+    #[must_use]
+    pub fn memory_used(&self) -> usize {
+        self.entities.read().unwrap().memory_used
     }
 
     /// Check memory pressure and evict if needed.
-    fn maybe_evict_inner(&self, hot: &mut HotTier) -> Result<(), StoreError> {
-        if !hot.over_threshold() {
+    fn maybe_evict_inner(&self, entities: &mut EntityStore) -> Result<(), StoreError> {
+        if !entities.over_threshold() {
             return Ok(());
         }
 
-        let evicted = hot.evict_lru(self.config.evict_batch_size);
+        let evicted = entities.evict_lru(self.config.evict_batch_size, &self.index);
         if !evicted.is_empty() {
             let mut warm = self.warm.lock().unwrap();
             for (rowid, meta) in &evicted {

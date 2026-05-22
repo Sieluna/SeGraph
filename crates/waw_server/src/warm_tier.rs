@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
-use crate::hot_tier::EntityMeta;
+use crate::entity_store::EntityMeta;
 
 /// Per-entity cache entry in the mmap file.
 #[derive(Clone, Copy, Debug)]

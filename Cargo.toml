@@ -10,6 +10,7 @@ publish = false
 [workspace.dependencies]
 waw_core = { path = "crates/waw_core" }
 waw_proto = { path = "crates/waw_proto" }
+waw_client = { path = "crates/waw_client" }
 waw_server = { path = "crates/waw_server" }
 bytes = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false }

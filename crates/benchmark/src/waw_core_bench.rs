@@ -94,7 +94,7 @@ pub struct TraversalResult {
     pub elapsed_us: u64,
 }
 
-/// Run all benchmarks against the waw_core graph.
+/// Run all benchmarks against the in-memory spatial grid reference implementation.
 pub fn run_benchmarks(nodes: &[NodeData], edges: &[EdgeData]) -> WawResults {
     // ------ Load ------
     let load_start = Instant::now();

@@ -1,20 +1,20 @@
+use core::time::Duration;
 use std::time::Instant;
 
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
-use waw_server::pipeline::{Pipeline, PipelineConfig};
+use waw_client::GraphClient;
+use waw_proto::{IndexQuery, ServerStats};
 
 use crate::graph_gen::{EdgeData, NodeData};
 
-pub struct WawResults {
-    pub load_ms: u64,
-    pub entity_count: usize,
-    pub edge_count: usize,
+pub struct WawClientResults {
+    pub connect_ms: u64,
+    pub stats: Option<ServerStats>,
+    pub entity_gets: Vec<EntityGetResult>,
     pub spatial_queries: Vec<SpatialResult>,
     pub traversals: Vec<TraversalResult>,
-    pub entity_gets: Vec<EntityGetResult>,
     pub full_scan_ms: u64,
-    pub memory_used_bytes: usize,
 }
 
 pub struct SpatialResult {
@@ -36,144 +36,13 @@ pub struct EntityGetResult {
     pub elapsed_us: u64,
 }
 
-/// Run benchmarks using the new `Pipeline` (waw_core Storage + CSR + warm/cold tiers).
-pub fn run_benchmarks(nodes: &[NodeData], edges: &[EdgeData]) -> WawResults {
+/// Create a temporary SQLite database with benchmark schema and data.
+/// Returns the temp file (must be kept alive) and its path.
+pub fn create_bench_db(nodes: &[NodeData], edges: &[EdgeData]) -> (NamedTempFile, std::path::PathBuf) {
     let tmp = NamedTempFile::new().unwrap();
-    {
-        let conn = Connection::open(tmp.path()).unwrap();
-        create_bench_schema(&conn);
-        populate_bench_data(&conn, nodes, edges);
-    }
+    let path = tmp.path().to_path_buf();
 
-    // Load via Pipeline
-    let load_start = Instant::now();
-    let pipeline = Pipeline::load(
-        tmp.path(),
-        None::<&str>,
-        PipelineConfig::default(),
-    )
-    .unwrap();
-    let load_ms = load_start.elapsed().as_millis() as u64;
-
-    let entity_count = nodes.len();
-    let edge_count = edges.len();
-
-    // Entity get: first access (cold tier → hot promotion) and second access (hot hit)
-    // Node IDs are 0..entity_count; pick representative samples
-    let n = entity_count as u64;
-    let sample_ids = [0u64, n / 4, n / 2, 3 * n / 4, n.saturating_sub(1)];
-    let mut entity_gets = Vec::new();
-
-    for &id in &sample_ids {
-        if id > n {
-            continue;
-        }
-        // First access — may go through cold tier
-        let t0 = Instant::now();
-        let hit = pipeline.get_entity(id).unwrap().is_some();
-        let elapsed_us = t0.elapsed().as_micros() as u64;
-        entity_gets.push(EntityGetResult {
-            id,
-            hit,
-            elapsed_us,
-        });
-    }
-
-    // Second access — should all be hot hits
-    for &id in &sample_ids {
-        if id > n {
-            continue;
-        }
-        let t0 = Instant::now();
-        let _ = pipeline.get_entity(id);
-        let elapsed_us = t0.elapsed().as_micros() as u64;
-        // Record second-access timing for the last entry (overwrites first timing)
-        if let Some(entry) = entity_gets.iter_mut().find(|e| e.id == id) {
-            entry.elapsed_us = elapsed_us;
-        }
-    }
-
-    // Spatial queries at the index's native LOD
-    let spatial_lod = pipeline.spatial_lod();
-
-    let viewport_bounds = [
-        (-1.0_f32, -1.0_f32, 1.0_f32, 1.0_f32),
-        (-0.5, -0.5, 0.5, 0.5),
-        (-0.25, -0.25, 0.25, 0.25),
-        (-1.0, -1.0, 0.0, 0.0),
-        (0.0, 0.0, 1.0, 1.0),
-    ];
-
-    let mut spatial_queries = Vec::new();
-    for &(min_x, min_y, max_x, max_y) in &viewport_bounds {
-        let t0 = Instant::now();
-        let results = pipeline.search_spatial(min_x, min_y, max_x, max_y, spatial_lod, u32::MAX);
-        let elapsed_us = t0.elapsed().as_micros() as u64;
-        spatial_queries.push(SpatialResult {
-            bounds: (min_x, min_y, max_x, max_y),
-            matched: results.len(),
-            elapsed_us,
-        });
-    }
-
-    // Graph traversals
-    let start_indices = [
-        0u64,
-        (n / 4) as u64,
-        (n / 2) as u64,
-        (3 * n / 4) as u64,
-    ];
-    let mut traversals = Vec::new();
-
-    for &start_id in &start_indices {
-        if start_id > n {
-            continue;
-        }
-        let t0 = Instant::now();
-        let visited = pipeline.traverse_bfs(start_id, 2, &[], u32::MAX);
-        let elapsed_us = t0.elapsed().as_micros() as u64;
-        traversals.push(TraversalResult {
-            start_id,
-            depth: 2,
-            visited: visited.len(),
-            elapsed_us,
-        });
-    }
-
-    // Full scan: iterate all entities via repeated get_entity calls
-    let t0 = Instant::now();
-    let mut total_x = 0.0f64;
-    let mut total_y = 0.0f64;
-    let mut count = 0u64;
-    for node in nodes {
-        if let Ok(Some(meta)) = pipeline.get_entity(node.id) {
-            if let Some((x, y)) = meta.position {
-                total_x += x as f64;
-                total_y += y as f64;
-            }
-        }
-        count += 1;
-    }
-    let _ = (total_x, total_y, count);
-    let full_scan_ms = t0.elapsed().as_millis() as u64;
-
-    // Memory usage — read from hot tier directly
-    let hot = pipeline.hot_tier_for_read();
-    let memory_used_bytes = hot.memory_used;
-
-    WawResults {
-        load_ms,
-        entity_count,
-        edge_count,
-        spatial_queries,
-        traversals,
-        entity_gets,
-        full_scan_ms,
-        memory_used_bytes,
-    }
-}
-
-fn create_bench_schema(conn: &Connection) {
+    let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         r#"
         CREATE TABLE entity (id INTEGER PRIMARY KEY);
@@ -207,14 +76,10 @@ fn create_bench_schema(conn: &Connection) {
         "#,
     )
     .unwrap();
-}
 
-fn populate_bench_data(conn: &Connection, nodes: &[NodeData], edges: &[EdgeData]) {
     conn.execute("BEGIN", []).unwrap();
 
-    let mut entity_stmt = conn
-        .prepare("INSERT INTO entity (id) VALUES (?1)")
-        .unwrap();
+    let mut entity_stmt = conn.prepare("INSERT INTO entity (id) VALUES (?1)").unwrap();
     for node in nodes {
         entity_stmt.execute([node.id as i64]).unwrap();
     }
@@ -260,4 +125,127 @@ fn populate_bench_data(conn: &Connection, nodes: &[NodeData], edges: &[EdgeData]
     }
 
     conn.execute("COMMIT", []).unwrap();
+
+    (tmp, path)
+}
+
+/// Run benchmarks against a waw_server instance via `GraphClient`.
+pub async fn run_client_benchmarks(
+    url: &str,
+    nodes: &[NodeData],
+) -> Result<WawClientResults, Box<dyn std::error::Error>> {
+    let n = nodes.len() as u64;
+
+    let mut client = GraphClient::new(Duration::from_secs(30));
+
+    // ── Connect + Hello ──
+    let t0 = Instant::now();
+    client.connect(url.parse()?).await?;
+    let connect_ms = t0.elapsed().as_millis() as u64;
+    let stats = client.stats().cloned();
+
+    // Warm up: load the first entity to trigger cold-tier promotion
+    let _ = client.get_entity(0, false, false).await;
+
+    // ── Entity gets ──
+    let sample_ids = [0u64, n / 4, n / 2, 3 * n / 4, n.saturating_sub(1)];
+    let mut entity_gets = Vec::new();
+
+    for &id in &sample_ids {
+        if id >= n {
+            continue;
+        }
+        match client.get_entity(id, false, false).await {
+            Ok(_) => {
+                // Second access (hot hit)
+                let t1 = Instant::now();
+                let hit = client.get_entity(id, false, false).await.is_ok();
+                let elapsed_us = t1.elapsed().as_micros() as u64;
+                entity_gets.push(EntityGetResult {
+                    id,
+                    hit,
+                    elapsed_us,
+                });
+            }
+            Err(_) => {
+                entity_gets.push(EntityGetResult {
+                    id,
+                    hit: false,
+                    elapsed_us: 0,
+                });
+            }
+        }
+    }
+
+    // ── Spatial queries ──
+    let viewport_bounds = [
+        (-1.0_f32, -1.0_f32, 1.0_f32, 1.0_f32),
+        (-0.5, -0.5, 0.5, 0.5),
+        (-0.25, -0.25, 0.25, 0.25),
+        (-1.0, -1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0, 1.0),
+    ];
+
+    let mut spatial_queries = Vec::new();
+    for &(min_x, min_y, max_x, max_y) in &viewport_bounds {
+        let t0 = Instant::now();
+        let results = client
+            .search(IndexQuery::Spatial {
+                min_x: min_x as f64,
+                min_y: min_y as f64,
+                max_x: max_x as f64,
+                max_y: max_y as f64,
+                limit: u32::MAX,
+            })
+            .await?;
+        let elapsed_us = t0.elapsed().as_micros() as u64;
+        spatial_queries.push(SpatialResult {
+            bounds: (min_x, min_y, max_x, max_y),
+            matched: results.len(),
+            elapsed_us,
+        });
+    }
+
+    // ── Graph traversals ──
+    let start_indices = [0u64, n / 4, n / 2, 3 * n / 4];
+    let mut traversals = Vec::new();
+
+    for &start_id in &start_indices {
+        if start_id >= n {
+            continue;
+        }
+        let t0 = Instant::now();
+        let visited = client
+            .traverse(start_id, 2, vec![], u32::MAX)
+            .await?;
+        let elapsed_us = t0.elapsed().as_micros() as u64;
+        traversals.push(TraversalResult {
+            start_id,
+            depth: 2,
+            visited: visited.len(),
+            elapsed_us,
+        });
+    }
+
+    // ── Full scan (sample-based) ──
+    let sample_size = 100.min(n as usize);
+    let t0 = Instant::now();
+    let mut scanned = 0u64;
+    for i in 0..sample_size {
+        let id = (i as u64 * n) / sample_size as u64;
+        if client.get_entity(id, false, false).await.is_ok() {
+            scanned += 1;
+        }
+    }
+    let full_scan_ms = t0.elapsed().as_millis() as u64;
+    let _ = scanned;
+
+    Ok(WawClientResults {
+        connect_ms,
+        stats,
+        entity_gets,
+        spatial_queries,
+        traversals,
+        full_scan_ms,
+    })
 }

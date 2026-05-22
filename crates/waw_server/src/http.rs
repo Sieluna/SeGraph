@@ -84,6 +84,16 @@ pub async fn serve_sqlite(
     addr: &str,
 ) -> Result<(), HttpError> {
     let addr: SocketAddr = addr.parse().map_err(HttpError::Addr)?;
+    let listener = TcpListener::bind(addr).await.map_err(HttpError::Bind)?;
+    serve_sqlite_on_listener(db_path, warm_cache_path, listener).await
+}
+
+pub async fn serve_sqlite_on_listener(
+    db_path: impl AsRef<std::path::Path>,
+    warm_cache_path: Option<impl AsRef<std::path::Path>>,
+    listener: TcpListener,
+) -> Result<(), HttpError> {
+    let addr = listener.local_addr().map_err(HttpError::Bind)?;
     let pipeline = Pipeline::load(db_path, warm_cache_path, PipelineConfig::default())?;
     let stats = pipeline.stats()?;
     let state = AppState {
@@ -96,7 +106,6 @@ pub async fn serve_sqlite(
         .route("/graph", get(graph_ws))
         .with_state(state);
 
-    let listener = TcpListener::bind(addr).await.map_err(HttpError::Bind)?;
     println!("Graph API server listening on http://{addr}");
     axum::serve(listener, app).await.map_err(HttpError::Serve)
 }
@@ -147,11 +156,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         let qid = query_id.fetch_add(1, Ordering::Relaxed);
 
         match control {
-            ClientMessage::GetEntity(r) => dispatch_get_entity(&mut sender, &state, qid, r).await,
-            ClientMessage::GetEdges(r) => dispatch_get_edges(&mut sender, &state, qid, r).await,
-            ClientMessage::Traverse(r) => dispatch_traverse(&mut sender, &state, qid, r).await,
-            ClientMessage::Search(q) => dispatch_search(&mut sender, &state, qid, q).await,
-            ClientMessage::GetBlob(r) => dispatch_get_blob(&mut sender, &state, qid, r).await,
+            ClientMessage::GetEntity(r) => {
+                dispatch_get_entity(&mut sender, &state, qid, r).await
+            }
+            ClientMessage::GetEdges(r) => {
+                dispatch_get_edges(&mut sender, &state, qid, r).await
+            }
+            ClientMessage::Traverse(r) => {
+                dispatch_traverse(&mut sender, &state, qid, r).await
+            }
+            ClientMessage::Search(q) => {
+                dispatch_search(&mut sender, &state, qid, q).await
+            }
+            ClientMessage::GetBlob(r) => {
+                dispatch_get_blob(&mut sender, &state, qid, r).await
+            }
         }
 
         let _ = send(&mut sender, &ServerMessage::Done { query_id: qid }).await;
@@ -164,8 +183,12 @@ async fn dispatch_get_entity(
     query_id: u32,
     req: GetEntity,
 ) {
-    match extract_entity(state, &req) {
-        Ok(data) => {
+    let pipeline = state.pipeline.clone();
+    let result =
+        tokio::task::spawn_blocking(move || extract_entity(&pipeline, &req)).await;
+
+    match result {
+        Ok(Ok(data)) => {
             let _ = send(
                 sender,
                 &ServerMessage::Entity(EntityData {
@@ -176,8 +199,12 @@ async fn dispatch_get_entity(
             )
             .await;
         }
-        Err(msg) => {
+        Ok(Err(msg)) => {
             let _ = send_error(sender, query_id, &msg).await;
+        }
+        Err(join_err) => {
+            let _ =
+                send_error(sender, query_id, &format!("panic: {join_err}")).await;
         }
     }
 }
@@ -188,9 +215,7 @@ struct EntityResponse {
     blob_refs: Vec<(String, BlobRef)>,
 }
 
-fn extract_entity(state: &AppState, req: &GetEntity) -> Result<EntityResponse, String> {
-    let pipeline = &state.pipeline;
-
+fn extract_entity(pipeline: &Pipeline, req: &GetEntity) -> Result<EntityResponse, String> {
     // Verify entity exists in the CSR index
     pipeline
         .find_entity_index(req.id)
@@ -253,7 +278,6 @@ async fn dispatch_get_edges(
         }
     }
 
-    // If no edges found, check the entity exists
     if list.is_empty() {
         if state.pipeline.find_entity_index(req.entity_id).is_none() {
             let _ =
@@ -333,8 +357,15 @@ async fn dispatch_search(
             max: _,
             limit,
         } => {
-            match state.pipeline.search_property(&key, limit) {
-                Ok(ids) => {
+            let pipeline = state.pipeline.clone();
+            let key_owned = key.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                pipeline.search_property(&key_owned, limit)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(ids)) => {
                     for id in &ids {
                         let msg = ServerMessage::Entity(EntityData {
                             id: *id,
@@ -346,8 +377,11 @@ async fn dispatch_search(
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let _ = send_error(sender, query_id, &e.to_string()).await;
+                }
+                Err(join_err) => {
+                    let _ = send_error(sender, query_id, &format!("panic: {join_err}")).await;
                 }
             }
         }
@@ -360,57 +394,73 @@ async fn dispatch_get_blob(
     query_id: u32,
     req: GetBlob,
 ) {
-    let blob_info = match state.pipeline.load_blob_by_hash(req.hash) {
-        Ok(Some(info)) => info,
-        Ok(None) => {
-            let _ = send_error(sender, query_id, &format!("blob not found: {:x}", req.hash)).await;
-            return;
-        }
-        Err(e) => {
-            let _ = send_error(sender, query_id, &e.to_string()).await;
-            return;
-        }
-    };
+    let pipeline = state.pipeline.clone();
+    let hash = req.hash;
+    let offset = req.offset;
+    let chunk_size = req.chunk_size;
 
-    let total = blob_info.size_bytes;
-    let mut offset = req.offset;
-
-    loop {
-        let chunk = match state.pipeline.load_blob_chunk(req.hash, offset, req.chunk_size) {
-            Ok(Some(d)) => d,
-            Ok(None) => break,
-            Err(msg) => {
-                let _ = send_error(sender, query_id, &msg.to_string()).await;
-                return;
-            }
+    // Collect all chunks off the tokio worker
+    let chunks_result = tokio::task::spawn_blocking(move || {
+        let blob_info = match pipeline.load_blob_by_hash(hash) {
+            Ok(Some(info)) => info,
+            Ok(None) => return Err(format!("blob not found: {hash:x}")),
+            Err(e) => return Err(e.to_string()),
         };
 
-        if chunk.is_empty() {
-            break;
+        let total = blob_info.size_bytes;
+        let mut offset = offset;
+        let mut chunks: Vec<(Vec<u8>, u64, u64)> = Vec::new();
+
+        loop {
+            let chunk = match pipeline.load_blob_chunk(hash, offset, chunk_size) {
+                Ok(Some(d)) => d,
+                Ok(None) => break,
+                Err(msg) => return Err(msg.to_string()),
+            };
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            let chunk_len = chunk.len() as u64;
+            let is_last = offset + chunk_len >= total;
+            chunks.push((chunk, offset, total));
+
+            if is_last {
+                break;
+            }
+            offset += chunk_len;
         }
 
-        let chunk_len = chunk.len() as u64;
-        let is_last = offset + chunk_len >= total;
+        Ok(chunks)
+    })
+    .await;
 
-        if send(
-            sender,
-            &ServerMessage::BlobChunk(waw_proto::BlobChunk {
-                hash: req.hash,
-                offset,
-                total_size: total,
-                data: chunk.into(),
-            }),
-        )
-        .await
-        .is_err()
-        {
-            return;
+    match chunks_result {
+        Ok(Ok(chunks)) => {
+            for (data, offset, total_size) in chunks {
+                if send(
+                    sender,
+                    &ServerMessage::BlobChunk(waw_proto::BlobChunk {
+                        hash,
+                        offset,
+                        total_size,
+                        data: data.into(),
+                    }),
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            }
         }
-
-        if is_last {
-            break;
+        Ok(Err(msg)) => {
+            let _ = send_error(sender, query_id, &msg).await;
         }
-        offset += chunk_len;
+        Err(join_err) => {
+            let _ = send_error(sender, query_id, &format!("panic: {join_err}")).await;
+        }
     }
 }
 

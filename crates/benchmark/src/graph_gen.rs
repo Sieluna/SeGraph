@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Pareto};
@@ -62,11 +62,11 @@ pub fn generate_graph(config: &GraphConfig) -> (Vec<NodeData>, Vec<EdgeData>) {
     // Generate nodes with positions clustered around centers
     let nodes: Vec<NodeData> = (0..n)
         .map(|id| {
-            let cluster = rng.gen_range(0..config.clusters);
+            let cluster = rng.random_range(0..config.clusters);
             let (cx, cy) = centers[cluster as usize];
             let spread = 0.15;
-            let x = (cx + rng.gen_range(-spread..spread)).clamp(-1.0, 1.0);
-            let y = (cy + rng.gen_range(-spread..spread)).clamp(-1.0, 1.0);
+            let x = (cx + rng.random_range(-spread..spread)).clamp(-1.0, 1.0);
+            let y = (cy + rng.random_range(-spread..spread)).clamp(-1.0, 1.0);
             NodeData { id, x, y, cluster }
         })
         .collect();
@@ -109,7 +109,7 @@ fn generate_edges(
         let mut remaining = degrees[i];
         while remaining > 0 && edge_count < total {
             // 70% chance same cluster, 30% any cluster
-            let coin: f32 = rng.r#gen();
+            let coin: f32 = rng.random();
             let target = if coin < 0.7 {
                 // Pick random node in same cluster
                 let same_cluster: Vec<usize> = nodes
@@ -119,12 +119,12 @@ fn generate_edges(
                     .map(|(j, _)| j)
                     .collect();
                 if same_cluster.is_empty() {
-                    rng.gen_range(0..nodes.len())
+                    rng.random_range(0..nodes.len())
                 } else {
-                    same_cluster[rng.gen_range(0..same_cluster.len())]
+                    same_cluster[rng.random_range(0..same_cluster.len())]
                 }
             } else {
-                rng.gen_range(0..nodes.len())
+                rng.random_range(0..nodes.len())
             };
 
             if target != i {

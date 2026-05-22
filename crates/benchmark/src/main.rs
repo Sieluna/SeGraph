@@ -1,3 +1,4 @@
+mod accuracy;
 mod graph_gen;
 mod neo4j_bench;
 mod waw_core_bench;
@@ -6,6 +7,8 @@ mod waw_server_bench;
 use std::time::Instant;
 
 use graph_gen::{GraphConfig, generate_graph, to_csv};
+use tokio::net::TcpListener;
+use waw_server::serve_sqlite_on_listener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,9 +34,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{:=<60}", "");
 
         let (nodes, edges) = generate_graph(config);
-        println!("  Generated {} nodes, {} edges", nodes.len(), edges.len());
+        println!(
+            "  Generated {} nodes, {} edges",
+            nodes.len(),
+            edges.len()
+        );
 
-        // waw_core benchmark: pure in-memory spatial grid + raw vec traversal
+        // ── waw_core benchmark: pure in-memory spatial grid + raw vec traversal ──
         if mode == "all" || mode == "waw" || mode == "core" {
             println!("\n  --- waw_core (pure memory, spatial grid) ---");
             let t0 = Instant::now();
@@ -60,47 +67,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Total core time: {} ms", total_ms);
         }
 
-        // waw_server benchmark: Pipeline (waw_core Storage + CSR + tiered cache)
+        // ── waw_server benchmark via GraphClient (WebSocket) ──
         if mode == "all" || mode == "waw" || mode == "server" {
-            println!("\n  --- waw_server (Pipeline: waw_core + CSR + warm/cold tiers) ---");
-            let t0 = Instant::now();
-            let results = waw_server_bench::run_benchmarks(&nodes, &edges);
-            println!("  Load:       {:>8} ms", results.load_ms);
-            println!("  Memory:     {:>8} bytes", results.memory_used_bytes);
-            println!("  Entities:   {:>8}", results.entity_count);
-            println!("  Edges:      {:>8}", results.edge_count);
-            for eg in &results.entity_gets {
-                println!(
-                    "  GetEntity #{}: {:>8} μs (hit={})",
-                    eg.id, eg.elapsed_us, eg.hit
-                );
+            println!("\n  --- waw_server (via waw_client GraphClient) ---");
+
+            // Create DB, start server, connect client, benchmark.
+            let (_tmp, _db_path) = waw_server_bench::create_bench_db(&nodes, &edges);
+
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let url = format!("ws://{addr}/graph");
+
+            let db_path = _db_path.clone();
+            let server = tokio::spawn(async move {
+                let _ = serve_sqlite_on_listener(&db_path, None::<&str>, listener).await;
+            });
+
+            // Give the server a moment to start
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            match waw_server_bench::run_client_benchmarks(&url, &nodes).await {
+                Ok(results) => {
+                    println!("  Connect:    {:>8} ms", results.connect_ms);
+                    if let Some(ref s) = results.stats {
+                        println!(
+                            "  Server:     {} entities, {} edges, {} blob bytes",
+                            s.entities, s.edges, s.blob_bytes
+                        );
+                    }
+                    for eg in &results.entity_gets {
+                        println!(
+                            "  GetEntity #{}: {:>8} μs (hit={})",
+                            eg.id, eg.elapsed_us, eg.hit
+                        );
+                    }
+                    for vp in &results.spatial_queries {
+                        println!(
+                            "  Spatial [{:.2}..{:.2}, {:.2}..{:.2}]: {:>8} μs, matched {}",
+                            vp.bounds.0,
+                            vp.bounds.2,
+                            vp.bounds.1,
+                            vp.bounds.3,
+                            vp.elapsed_us,
+                            vp.matched
+                        );
+                    }
+                    for tr in &results.traversals {
+                        println!(
+                            "  Traversal depth={} from #{}: {:>8} μs, visited {}",
+                            tr.depth, tr.start_id, tr.elapsed_us, tr.visited
+                        );
+                    }
+                    println!("  Full scan (sample): {:>8} ms", results.full_scan_ms);
+                }
+                Err(e) => {
+                    println!("  Client benchmark error: {e}");
+                }
             }
-            for vp in &results.spatial_queries {
-                println!(
-                    "  Spatial [{:.2}..{:.2}, {:.2}..{:.2}]: {:>8} μs, matched {}",
-                    vp.bounds.0, vp.bounds.2, vp.bounds.1, vp.bounds.3, vp.elapsed_us, vp.matched
-                );
-            }
-            for tr in &results.traversals {
-                println!(
-                    "  Traversal depth={} from #{}: {:>8} μs, visited {}",
-                    tr.depth, tr.start_id, tr.elapsed_us, tr.visited
-                );
-            }
-            println!(
-                "  Full scan:  {:>8} ms ({} nodes)",
-                results.full_scan_ms,
-                nodes.len()
-            );
-            let total_ms = t0.elapsed().as_millis();
-            println!("  Total pipeline time: {} ms", total_ms);
+
+            server.abort();
+            drop(_tmp); // Ensure temp DB is deleted after server stops
         }
 
-        // Run Neo4j benchmark (if available and mode allows)
+        // ── Neo4j benchmark (via neo4rs) ──
         if mode == "all" || mode == "neo4j" {
             println!("\n  --- Neo4j (via neo4rs) ---");
-            match neo4j_bench::run_benchmarks(&nodes, &edges, "127.0.0.1:7687", "neo4j", "neograph")
-                .await
+            match neo4j_bench::run_benchmarks(
+                &nodes,
+                &edges,
+                "127.0.0.1:7687",
+                "neo4j",
+                "neograph",
+            )
+            .await
             {
                 Ok(results) => {
                     println!("  Import:     {:>8} ms", results.import_ms);
@@ -132,10 +171,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // ── Accuracy: Pipeline vs brute-force ground truth ──
+        if mode == "all" || mode == "accuracy" {
+            println!("\n  --- Accuracy: Pipeline vs brute-force ground truth ---");
+            let report = accuracy::run_accuracy(&nodes, &edges);
+            println!(
+                "  Spatial: {} queries, {} mismatches",
+                report.spatial_queries,
+                report.spatial_mismatches.len()
+            );
+            if !report.spatial_mismatches.is_empty() {
+                for m in &report.spatial_mismatches {
+                    println!("    FAIL: {m}");
+                }
+            }
+            println!(
+                "  BFS:     {} queries, {} mismatches",
+                report.bfs_queries,
+                report.bfs_mismatches.len()
+            );
+            if !report.bfs_mismatches.is_empty() {
+                for m in &report.bfs_mismatches {
+                    println!("    FAIL: {m}");
+                }
+            }
+            println!(
+                "  Edges:   {} queries, {} mismatches",
+                report.edge_queries,
+                report.edge_mismatches.len()
+            );
+            if !report.edge_mismatches.is_empty() {
+                for m in &report.edge_mismatches {
+                    println!("    FAIL: {m}");
+                }
+            }
+            if report.all_ok() {
+                println!("  ALL ACCURACY CHECKS PASSED");
+            } else {
+                println!("  *** ACCURACY FAILURES DETECTED ***");
+            }
+        }
+
         // Export CSVs for neo4j-admin import
         let (nodes_csv, edges_csv) = to_csv(&nodes, &edges);
         let prefix = format!("benchmark_data_{}", label);
-        let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let data_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
         std::fs::create_dir_all(&data_dir)?;
         std::fs::write(data_dir.join(format!("{}_nodes.csv", prefix)), nodes_csv)?;
         std::fs::write(data_dir.join(format!("{}_edges.csv", prefix)), edges_csv)?;

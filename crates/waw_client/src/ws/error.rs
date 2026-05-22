@@ -8,12 +8,6 @@ pub enum Error {
     #[error("WebSocket connection timeout")]
     Timeout,
 
-    #[error("URL parse error: {0}")]
-    UrlParse(#[from] url::ParseError),
-
-    #[error("Protocol error: {0}")]
-    Protocol(alloc::string::String),
-
     #[cfg(not(target_arch = "wasm32"))]
     #[error("WebSocket error: {0}")]
     Transport(#[from] tokio_tungstenite::tungstenite::Error),
