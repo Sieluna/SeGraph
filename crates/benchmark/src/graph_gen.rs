@@ -3,6 +3,73 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Pareto};
 
+/// Predefined graph scales for multi-scale benchmarking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphScale {
+    /// 1,000 nodes
+    K1,
+    /// 10,000 nodes
+    K10,
+    /// 100,000 nodes
+    K100,
+    /// 1,000,000 nodes
+    M1,
+}
+
+impl GraphScale {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "1K" => Some(GraphScale::K1),
+            "10K" => Some(GraphScale::K10),
+            "100K" => Some(GraphScale::K100),
+            "1M" => Some(GraphScale::M1),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            GraphScale::K1 => "1K",
+            GraphScale::K10 => "10K",
+            GraphScale::K100 => "100K",
+            GraphScale::M1 => "1M",
+        }
+    }
+
+    pub fn config(&self) -> GraphConfig {
+        match self {
+            GraphScale::K1 => GraphConfig {
+                node_count: 1_000,
+                avg_degree: 5,
+                clusters: 2,
+                pareto_shape: 2.0,
+                seed: 42,
+            },
+            GraphScale::K10 => GraphConfig {
+                node_count: 10_000,
+                avg_degree: 5,
+                clusters: 4,
+                pareto_shape: 2.0,
+                seed: 42,
+            },
+            GraphScale::K100 => GraphConfig {
+                node_count: 100_000,
+                avg_degree: 5,
+                clusters: 8,
+                pareto_shape: 2.0,
+                seed: 42,
+            },
+            GraphScale::M1 => GraphConfig {
+                node_count: 1_000_000,
+                avg_degree: 5,
+                clusters: 16,
+                pareto_shape: 2.0,
+                seed: 42,
+            },
+        }
+    }
+}
+
 /// A generated node with position and cluster.
 #[derive(Clone, Debug)]
 pub struct NodeData {
@@ -72,7 +139,8 @@ pub fn generate_graph(config: &GraphConfig) -> (Vec<NodeData>, Vec<EdgeData>) {
         .collect();
 
     // Generate edges with power-law degree distribution
-    let pareto = Pareto::new(1.0, config.pareto_shape).unwrap();
+    let pareto = Pareto::new(1.0, config.pareto_shape)
+        .expect("Pareto distribution requires shape > 0");
     let edges = generate_edges(&nodes, total_edges, &pareto, &mut rng);
 
     (nodes, edges)
@@ -142,6 +210,7 @@ fn generate_edges(
 }
 
 /// Serialize nodes and edges to CSV strings for Neo4j import.
+#[allow(dead_code)]
 pub fn to_csv(nodes: &[NodeData], edges: &[EdgeData]) -> (String, String) {
     let nodes_csv = {
         let mut csv = String::from("id:ID,x:FLOAT,y:FLOAT,cluster:INT\n");
