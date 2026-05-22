@@ -1,4 +1,3 @@
-use std::ops::Index;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -209,8 +208,7 @@ impl Pipeline {
         visited
     }
 
-    /// Spatial bounding-box query — shared entity read lock only.
-    /// Results are exactly filtered by entity position (not just tile overlap).
+    /// Returns entity rowids matching a spatial bounding-box query.
     #[must_use]
     pub fn search_spatial(
         &self,
@@ -223,19 +221,25 @@ impl Pipeline {
     ) -> Vec<u64> {
         let entities = self.entities.read().unwrap();
         let mut out = Vec::new();
+
+        // Adaptive LOD: drop one level for large viewports with small limit
+        let effective_lod = if let Some(ref idx) = self.index.spatial_index {
+            let cells = idx.estimate_cell_count(min_x, min_y, max_x, max_y, lod);
+            if cells > idx.total_cells() / 2 && limit < 1000 && lod > 1 {
+                lod.saturating_sub(1)
+            } else {
+                lod
+            }
+        } else {
+            lod
+        };
+
         self.index.query_spatial_into(
-            min_x, min_y, max_x, max_y, lod,
+            min_x, min_y, max_x, max_y, effective_lod,
             &entities.entity_ptrs,
             &mut out,
+            limit,
         );
-        // Exact position filtering — spatial index is tile-approximate
-        out.retain(|&rowid| {
-            let Some(csr_idx) = self.index.find_entity_index(rowid) else { return false };
-            let Some(Some(ptr)) = entities.entity_ptrs.get(csr_idx as usize) else { return false };
-            let Some((x, y)) = entities.entities.index(ptr).position else { return false };
-            x >= min_x && x <= max_x && y >= min_y && y <= max_y
-        });
-        out.truncate(limit as usize);
         out
     }
 

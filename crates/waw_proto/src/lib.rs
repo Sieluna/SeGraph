@@ -11,6 +11,6 @@ pub use tile::{
     TILE_FRAME_MAGIC, TILE_FRAME_VERSION, decode_tile_batch, encode_tile_batch,
 };
 pub use types::{
-    BatchHeader, BlobChunk, BlobRef, CodecSet, Direction, EdgeData, EntityData, GetBlob, GetEdges,
-    GetEntity, IndexQuery, Property, PropertyType, ServerStats, Traverse, Value,
+    BatchHeader, BlobChunk, BlobRef, CodecSet, Direction, EdgeData, EntityBatch, EntityData,
+    GetBlob, GetEdges, GetEntity, IndexQuery, Property, PropertyType, ServerStats, Traverse, Value,
 };

@@ -21,7 +21,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use waw_proto::{
-    BlobRef, ClientMessage, CodecSet, EntityData, GetBlob, GetEdges, GetEntity,
+    BlobRef, ClientMessage, CodecSet, EntityBatch, EntityData, GetBlob, GetEdges, GetEntity,
     IndexQuery, Property, PropertyType, ServerMessage, ServerStats, Traverse, Value,
     decode_client_message, encode_server_message,
 };
@@ -300,13 +300,27 @@ async fn dispatch_traverse(
         req.limit,
     );
 
-    for id in &visited {
-        let msg = ServerMessage::Entity(EntityData {
-            id: *id,
-            properties: Vec::new(),
-            blob_refs: Vec::new(),
-        });
-        if send(sender, &msg).await.is_err() {
+    send_entity_batch(sender, &visited).await;
+}
+
+/// Send entity IDs in batches to reduce WebSocket frame overhead.
+async fn send_entity_batch(sender: &mut WsSender, ids: &[u64]) {
+    const BATCH_SIZE: usize = 64;
+    for chunk in ids.chunks(BATCH_SIZE) {
+        let batch = EntityBatch {
+            entities: chunk
+                .iter()
+                .map(|id| EntityData {
+                    id: *id,
+                    properties: Vec::new(),
+                    blob_refs: Vec::new(),
+                })
+                .collect(),
+        };
+        if send(sender, &ServerMessage::EntityBatch(batch))
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -335,16 +349,7 @@ async fn dispatch_search(
                 lod,
                 limit,
             );
-            for id in &results {
-                let msg = ServerMessage::Entity(EntityData {
-                    id: *id,
-                    properties: Vec::new(),
-                    blob_refs: Vec::new(),
-                });
-                if send(sender, &msg).await.is_err() {
-                    return;
-                }
-            }
+            send_entity_batch(sender, &results).await;
         }
         IndexQuery::Property {
             key,

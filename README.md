@@ -26,20 +26,22 @@ Neo4j must be running before benchmarking with `--systems neo4j` or `--systems a
 
 | Operation | WAW | Neo4j | Ratio |
 |---|---|---|---|
-| Entity get (avg) | 63 μs | 345 μs | WAW **5.5×** |
-| BFS depth=2 (avg) | 230 μs | 680 μs | WAW **3.0×** |
-| Spatial small viewport | 49 μs | 1,220 μs | WAW **24.9×** |
-| Spatial full viewport | 63 ms | 43 ms | Neo4j **1.5×** |
-| Spatial mid viewport | 34 ms | 22 ms | Neo4j **1.5×** |
-| Import | 82 ms | 1,038 ms | WAW **12.7×** |
+| Entity get (avg) | 63 μs | 505 μs | WAW **8.1×** |
+| BFS depth=2 (avg) | 87 μs | 1,178 μs | WAW **13.6×** |
+| Spatial small viewport | 62 μs | 1,556 μs | WAW **25.1×** |
+| Spatial mid viewport | 1.2 ms | 25.0 ms | WAW **21.7×** |
+| Spatial full viewport | 17.4 ms | 48.7 ms | WAW **2.8×** |
+| Full scan | 2.8 ms | 482 μs | Neo4j **5.8×** |
+| Import | 126 ms | 1,038 ms | WAW **8.2×** |
 
 ### 100K nodes (496K edges, Win)
 
 | Operation | WAW | Neo4j | Ratio |
 |---|---|---|---|
 | Entity get (avg) | 59 μs | 531 μs | WAW **9.0×** |
-| BFS depth=2 (avg) | 349 μs | 761 μs | WAW **2.2×** |
-| Spatial small viewport | 8.7 ms | 10.6 ms | WAW **1.2×** |
-| Spatial full viewport | 713 ms | 455 ms | Neo4j **1.6×** |
-| Spatial mid viewport | 526 ms | 339 ms | Neo4j **1.6×** |
-| Import | 381 ms | 10,271 ms | WAW **27.0×** |
+| BFS depth=2 (avg) | 89 μs | 761 μs | WAW **8.6×** |
+| Spatial small viewport | 380 μs | 10.6 ms | WAW **27.9×** |
+| Spatial mid viewport | 12.5 ms | 339 ms | WAW **27.1×** |
+| Spatial full viewport | 16.4 ms | 455 ms | WAW **27.7×** |
+| Full scan | 15.7 ms | 387 μs | Neo4j **40.6×** |
+| Import | 484 ms | 10,271 ms | WAW **21.2×** |

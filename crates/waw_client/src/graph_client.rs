@@ -106,6 +106,13 @@ impl GraphClient {
                 } if err_id == query_id => {
                     return Err(ClientError::Server(message));
                 }
+                ServerMessage::EntityBatch(batch) => {
+                    for entity in batch.entities {
+                        if let Some(item) = on_message(ServerMessage::Entity(entity)) {
+                            results.push(item);
+                        }
+                    }
+                }
                 ServerMessage::Done { .. }
                 | ServerMessage::Error { .. }
                 | ServerMessage::Hello { .. }

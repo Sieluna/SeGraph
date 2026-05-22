@@ -137,6 +137,11 @@ pub struct BlobChunk {
 }
 
 #[derive(Clone, Debug, PartialEq, Archive, Serialize, Deserialize)]
+pub struct EntityBatch {
+    pub entities: Vec<EntityData>,
+}
+
+#[derive(Clone, Debug, PartialEq, Archive, Serialize, Deserialize)]
 pub struct BatchHeader {
     pub query_id: u32,
     pub entity_count: u16,

@@ -332,8 +332,7 @@ impl GraphIndex {
         result
     }
 
-    /// Spatial query — reads spatial index + entity_rowids (lock-free on self),
-    /// checks `entity_ptrs` (caller provides under read lock).
+    /// Runs a spatial query with inline position filtering. No separate retain pass needed.
     pub fn query_spatial_into(
         &self,
         min_x: f32,
@@ -343,21 +342,21 @@ impl GraphIndex {
         lod: u16,
         entity_ptrs: &[Option<waw_core::Pointer<crate::entity_store::EntityMeta>>],
         out: &mut Vec<u64>,
+        limit: u32,
     ) {
         out.clear();
         let Some(ref index) = self.spatial_index else {
             return;
         };
 
+        let entity_count = self.edge_csr.entity_rowids.len();
+        if entity_count == 0 {
+            return;
+        }
+
+        let entity_rowids = &self.edge_csr.entity_rowids;
+
         QueryContext::with(|ctx| {
-            ctx.spatial_buf.clear();
-            index.query_bounds_into(min_x, min_y, max_x, max_y, lod, &mut ctx.spatial_buf);
-
-            let entity_count = self.edge_csr.entity_rowids.len();
-            if ctx.spatial_buf.is_empty() || entity_count == 0 {
-                return;
-            }
-
             ctx.seen_gen = ctx.seen_gen.wrapping_add(1);
             let generation = ctx.seen_gen;
 
@@ -365,23 +364,19 @@ impl GraphIndex {
                 ctx.seen_set.resize(entity_count, 0);
             }
 
-            let entity_rowids = &self.edge_csr.entity_rowids;
-            let seen = &mut ctx.seen_set;
-
-            for &idx in &ctx.spatial_buf {
-                let i = idx as usize;
-                if i >= entity_count {
-                    continue;
-                }
-                let slot = unsafe { seen.get_unchecked_mut(i) };
-                if *slot == generation {
-                    continue;
-                }
-                *slot = generation;
-                if entity_ptrs[i].is_some() {
-                    out.push(*unsafe { entity_rowids.get_unchecked(i) });
-                }
-            }
+            index.query_filtered_into(
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+                lod,
+                entity_ptrs,
+                entity_rowids,
+                &mut ctx.seen_set,
+                generation,
+                out,
+                limit as usize,
+            );
         });
     }
 

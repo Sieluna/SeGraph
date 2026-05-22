@@ -1,8 +1,8 @@
 use rkyv::{Archive, Deserialize, Serialize, rancor::Error as RkyvError};
 
 use crate::types::{
-    BlobChunk, BatchHeader, EdgeData, EntityData, GetBlob, GetEdges, GetEntity, IndexQuery,
-    ServerStats, Traverse,
+    BlobChunk, BatchHeader, EdgeData, EntityBatch, EntityData, GetBlob, GetEdges, GetEntity,
+    IndexQuery, ServerStats, Traverse,
 };
 
 #[derive(Clone, Debug, PartialEq, Archive, Serialize, Deserialize)]
@@ -18,6 +18,7 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     Hello { stats: ServerStats },
     Entity(EntityData),
+    EntityBatch(EntityBatch),
     Edge(EdgeData),
     Batch(BatchHeader),
     BlobChunk(BlobChunk),
